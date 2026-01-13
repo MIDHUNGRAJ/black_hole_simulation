@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-Time Black Hole Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #fff;
+            font-family: sans-serif;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px #000;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>Schwarzschild Black Hole</h1>
+        <p>Mouse drag to rotate. Scroll to zoom.</p>
+    </div>
+    <canvas id="glcanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('glcanvas');
+        const gl = canvas.getContext('webgl');
+
+        if (!gl) {
+            alert('Unable to initialize WebGL.');
+        }
+
+        // Vertex Shader
+        const vsSource = `
+            attribute vec4 aVertexPosition;
+            void main() {
+                gl_Position = aVertexPosition;
+            }
+        `;
+
+        // Fragment Shader (The Physics Engine)
+        const fsSource = `
+            precision highp float;
+
+            uniform vec2 iResolution;
+            uniform float iTime;
+            uniform vec2 iMouse; // Normalized mouse pos
+            uniform float iZoom;
+
+            #define MAX_STEPS 100
+            #define MAX_DIST 50.0
+            #define SURF_DIST 0.01
+            #define PI 3.14159265359
+
+            // Black Hole Parameters
+            // Rs = 2M. Let's say Rs = 1.0 radius.
+            const float Rs = 1.0; 
+            const float ISCO = 3.0 * Rs; // Innermost stable circular orbit for accretion disk
+
+            // Noise for stars
+            float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+            }
+
+            float noise(vec3 p) {
+                vec3 i = floor(p);
+                vec3 f = fract(p);
+                f = f * f * (3.0 - 2.0 * f);
+                return mix(
+                    mix(mix(hash(i.xy + vec2(0,0)), hash(i.xy + vec2(1,0)), f.x),
+                        mix(hash(i.xy + vec2(0,1)), hash(i.xy + vec2(1,1)), f.x), f.y),
+                    mix(mix(hash(i.xy + vec2(0,0) + 1.0), hash(i.xy + vec2(1,0) + 1.0), f.x),
+                        mix(hash(i.xy + vec2(0,1) + 1.0), hash(i.xy + vec2(1,1) + 1.0), f.x), f.y), f.z
+                );
+            }
+
+            // Galaxy Background
+            vec3 getBackground(vec3 dir) {
+                // Procedural milky way
+                float phi = atan(dir.z, dir.x);
+                float theta = acos(dir.y);
+                
+                // Band
+                float band = sin(phi*2.0 + 3.0*sin(phi)) * 0.5 + 0.5;
+                float galaxy = exp(-abs(dir.y + 0.2 * sin(phi)) * 4.0);
+                
+                vec3 col = vec3(0.05, 0.05, 0.1); // Base space color
+                
+                // Nebula
+                col += vec3(0.2, 0.1, 0.3) * galaxy;
+                col += vec3(0.1, 0.2, 0.4) * galaxy * noise(dir*5.0);
+                
+                // Stars
+                float star = pow(hash(dir.xy * 50.0 + dir.z*10.0), 300.0);
+                col += vec3(star);
+                
+                return col;
+            }
+
+            // Accretion Disk (Procedural)
+            vec4 getDisk(vec3 pos) {
+                float r = length(pos);
+                if (r < 1.5 * Rs || r > 6.0 * Rs) return vec4(0.0);
+                if (abs(pos.y) > 0.05 * r) return vec4(0.0); // Thin disk
+                
+                // Rotate pattern
+                float angle = atan(pos.z, pos.x) + 5.0 / (r*r) * iTime * 0.5;
+                
+                float density = 1.0;
+                density *= 0.5 + 0.5 * sin(angle * 10.0 + r * 10.0); // Spirals
+                density *= smoothstep(1.5*Rs, 2.0*Rs, r); // Fade in inner
+                density *= smoothstep(6.0*Rs, 4.0*Rs, r); // Fade out outer
+                
+                // Temperature drops with radius
+                float temp = 1.0 / (r*r);
+                vec3 col = vec3(1.0, 0.6, 0.2) * temp * 20.0 * density;
+                
+                return vec4(col, density * 0.5); // Additive
+            }
+
+            void main() {
+                // UV coordinates [-1, 1]
+                vec2 uv = (gl_FragCoord.xy - 0.5 * iResolution.xy) / iResolution.y;
+                
+                // Camera setup
+                float camDist = 10.0 * iZoom;
+                
+                // Mouse rotation
+                float rotX = (iMouse.y / iResolution.y - 0.5) * PI;
+                float rotY = -(iMouse.x / iResolution.x - 0.5) * 2.0 * PI;
+                
+                vec3 camPos = vec3(0.0, 0.0, camDist);
+                
+                // Rotate camera around origin
+                mat3 rotYMat = mat3(
+                    cos(rotY), 0.0, sin(rotY),
+                    0.0, 1.0, 0.0,
+                    -sin(rotY), 0.0, cos(rotY)
+                );
+                mat3 rotXMat = mat3(
+                    1.0, 0.0, 0.0,
+                    0.0, cos(rotX), -sin(rotX),
+                    0.0, sin(rotX), cos(rotX)
+                );
+                
+                camPos = rotYMat * rotXMat * camPos;
+                
+                vec3 forward = normalize(-camPos);
+                vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), forward));
+                vec3 up = cross(forward, right);
+                
+                vec3 ro = camPos;
+                vec3 rd = normalize(forward + uv.x * right + uv.y * up);
+                
+                // Raymarching Geodesics (Simplified)
+                // Integrating full GR equations in a pixel shader is expensive.
+                // We use a simplified step bending approach:
+                // Effectively treating space as having a refractive index n(r) = 1 / (1 - Rs/r)
+                // This gives correct qualitative lensing (Einstein ring, shadow) without full Christoffel symbols
+                
+                vec3 col = vec3(0.0);
+                vec3 p = ro;
+                vec3 dir = rd;
+                
+                vec4 diskAccum = vec4(0.0);
+                
+                float stepSize = 0.1;
+                
+                bool hitHorizon = false;
+                
+                for(int i=0; i<300; i++) {
+                    float r = length(p);
+                    
+                    if(r < Rs) {
+                        hitHorizon = true;
+                        break;
+                    }
+                    if(r > 50.0) break;
+                    
+                    // Simple Gravity Bending
+                    // Acceleration is towards center ~ 1/r^2 (Newtonian) * Correction
+                    // In GR, light deflection is roughly 4M/r for large r.
+                    // We can update direction: d(dir)/dt ~ -grad(n)
+                    
+                    // Schwarzschild effective potential bending
+                    // Bending force perpendicular to velocity ~ 1.5 * Rs / r^3 * (p x dir) x p theoretically difficult
+                    // Let's use simple Newtonian gravity for light * 2 (approx GR)
+                    // Acceleration vector a = - 3/2 * Rs * p / r^4 (roughly, actually 3/2 Rs r_hat / r^2 for light?)
+                    // Let's just use a refractive model: n = 1 + Rs/r
+                    
+                    // Adaptive step size
+                    float dt = max(0.05, r * 0.1); 
+                    if (r < 3.0*Rs) dt = 0.02;
+                    
+                    // Accretion Disk Sample
+                    // We accumulate light as we pass through the disk
+                    vec4 diskSample = getDisk(p);
+                    diskAccum += diskSample * (1.0 - diskAccum.a) * dt;
+                    if(diskAccum.a > 0.99) break;
+
+                    // Update Position
+                    p += dir * dt;
+                    
+                    // Update Direction (Gravity)
+                    // Curvature factor: 1.5 * Rs / r^3 works well visibly
+                    // Force = -C * p
+                    vec3 force = -1.5 * Rs * p / pow(dot(p, p), 2.5); 
+                    
+                    // Deflect direction
+                    dir += force * dt;
+                    dir = normalize(dir);
+                }
+                
+                if(hitHorizon) {
+                    col = vec3(0.0); // Black hole shadow
+                } else {
+                    col = getBackground(dir);
+                }
+                
+                // Composite disk
+                col = col * (1.0 - diskAccum.a) + diskAccum.rgb;
+                
+                gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+
+        function initShaderProgram(gl, vsSource, fsSource) {
+            const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                alert('Unable to initialize the shader program: ' + gl.getProgramInfoLog(shaderProgram));
+                return null;
+            }
+
+            return shaderProgram;
+        }
+
+        function loadShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                alert('An error occurred compiling the shaders: ' + gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+
+            return shader;
+        }
+
+        const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+        const programInfo = {
+            program: shaderProgram,
+            attribLocations: {
+                vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
+            },
+            uniformLocations: {
+                iResolution: gl.getUniformLocation(shaderProgram, 'iResolution'),
+                iTime: gl.getUniformLocation(shaderProgram, 'iTime'),
+                iMouse: gl.getUniformLocation(shaderProgram, 'iMouse'),
+                iZoom: gl.getUniformLocation(shaderProgram, 'iZoom'),
+            },
+        };
+
+        // Buffers
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        const positions = [
+             1.0,  1.0,
+            -1.0,  1.0,
+             1.0, -1.0,
+            -1.0, -1.0,
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+        let mouseX = 0;
+        let mouseY = 0;
+        let isDragging = false;
+        let zoom = 1.0;
+
+        // Mouse Events
+        canvas.addEventListener('mousedown', e => { isDragging = true; });
+        canvas.addEventListener('mouseup', e => { isDragging = false; });
+        canvas.addEventListener('mousemove', e => {
+            if (isDragging) {
+                mouseX += e.movementX;
+                mouseY += e.movementY;
+            }
+        });
+        canvas.addEventListener('wheel', e => {
+             zoom += e.deltaY * 0.001;
+             zoom = Math.max(0.1, Math.min(zoom, 5.0));
+        });
+
+
+        // Resize
+        function resizeCanvasToDisplaySize(canvas) {
+            const width = canvas.clientWidth;
+            const height = canvas.clientHeight;
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width;
+                canvas.height = height;
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+            }
+        }
+
+        // Render Loop
+        function render(time) {
+            time *= 0.001; // seconds
+
+            resizeCanvasToDisplaySize(canvas);
+
+            gl.useProgram(programInfo.program);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.vertexAttribPointer(programInfo.attribLocations.vertexPosition, 2, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(programInfo.attribLocations.vertexPosition);
+
+            gl.uniform2f(programInfo.uniformLocations.iResolution, canvas.width, canvas.height);
+            gl.uniform1f(programInfo.uniformLocations.iTime, time);
+            gl.uniform2f(programInfo.uniformLocations.iMouse, mouseX, mouseY);
+            gl.uniform1f(programInfo.uniformLocations.iZoom, zoom);
+
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            requestAnimationFrame(render);
+        }
+        
+        requestAnimationFrame(render);
+
+    </script>
+</body>
+</html>
